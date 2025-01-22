@@ -1,6 +1,6 @@
-;; Bitcoin DeFi Orchestrator
-;; Initial Implementation
-;; Version: 1.0.0
+;; Bitcoin DeFi Orchestrator - Phase 2
+;; Advanced Features Implementation
+;; Version: 2.0.0
 
 ;; Define traits for contract interfaces
 (define-trait defi-validator-trait
@@ -9,28 +9,37 @@
     )
 )
 
-;; Constants
+;; Constants and Error Codes
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_UNAUTHORIZED (err u100))
 (define-constant ERR_INVALID_STEPS (err u101))
 (define-constant ERR_SAFETY_CHECK_FAILED (err u102))
 (define-constant ERR_INVALID_CONTRACT (err u103))
+(define-constant ERR_INSUFFICIENT_FEES (err u104))
+(define-constant ERR_BATCH_PROCESSING_FAILED (err u105))
+(define-constant ERR_INVALID_PRIORITY (err u106))
 
 ;; Status Constants - exactly 20 characters each
-(define-constant STATUS_INITIATED u"initiated...........")  ;; 20 chars
-(define-constant STATUS_COMPLETED u"completed...........")  ;; 20 chars
-(define-constant STATUS_FAILED    u"failed..............")  ;; 20 chars
+(define-constant STATUS_INITIATED u"initiated...........")
+(define-constant STATUS_COMPLETED u"completed...........")
+(define-constant STATUS_FAILED    u"failed..............")
+(define-constant STATUS_PENDING   u"pending.............")
 
 ;; Data Variables
 (define-data-var last-execution-id uint u0)
+(define-data-var min-fee-amount uint u100)
+(define-data-var fee-basis-points uint u30)  ;; 0.3%
 
-;; Data Maps
+;; Data Maps for Main Execution Tracking
 (define-map executions
     uint
     {
         status: (string-utf8 20),
         timestamp: uint,
-        executor: principal
+        executor: principal,
+        priority: uint,
+        fee-paid: uint,
+        batch-id: (optional uint)
     }
 )
 
@@ -40,16 +49,37 @@
         operation: (string-utf8 30),
         target-contract: principal,
         amount: uint,
-        params: (list 10 uint)
+        params: (list 10 uint),
+        dependencies: (list 5 uint)
     }
 )
 
-(define-map safety-configs
+;; Priority and Batch Management Maps
+(define-map priority-levels
     uint
     {
-        max-slippage: uint,
-        deadline: uint,
-        min-output: uint
+        multiplier: uint,
+        min-stake: uint,
+        max-gas: uint
+    }
+)
+
+(define-map batch-configs
+    uint 
+    {
+        max-size: uint,
+        timeout: uint,
+        min-participants: uint
+    }
+)
+
+(define-map active-batches
+    uint
+    {
+        participants: (list 50 principal),
+        total-value: uint,
+        created-at: uint,
+        status: (string-utf8 20)
     }
 )
 
@@ -63,140 +93,144 @@
     (map-get? executions execution-id)
 )
 
-(define-read-only (validate-safety-params (max-slippage uint) (deadline uint) (min-output uint))
+(define-read-only (calculate-fee (amount uint) (priority uint))
     (let
         (
-            (current-block block-height)
+            (base-fee (/ (* amount (var-get fee-basis-points)) u10000))
+            (priority-config (unwrap-panic (map-get? priority-levels priority)))
+            (priority-multiplier (get multiplier priority-config))
         )
-        (and
-            (< max-slippage u1000) ;; Max 10% slippage
-            (> deadline current-block)
-            (> min-output u0)
-        )
+        (* base-fee priority-multiplier)
     )
+)
+
+(define-read-only (get-batch-status (batch-id uint))
+    (map-get? active-batches batch-id)
 )
 
 (define-read-only (is-whitelisted (contract-principal principal))
     (default-to false (map-get? whitelisted-contracts contract-principal))
 )
 
-;; Public functions
+;; Priority Management
+(define-public (set-priority-level 
+    (level uint) 
+    (multiplier uint) 
+    (min-stake uint)
+    (max-gas uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (ok (map-set priority-levels level {
+            multiplier: multiplier,
+            min-stake: min-stake,
+            max-gas: max-gas
+        }))
+    )
+)
+
+;; Enhanced Strategy Execution
 (define-public (execute-defi-strategy 
     (validator-contract <defi-validator-trait>)
     (operations (list 10 (string-utf8 30)))
     (target-contracts (list 10 principal))
     (amounts (list 10 uint))
-    (max-slippage uint)
-    (deadline uint)
-    (min-output uint))
+    (priority uint)
+    (batch-id (optional uint)))
     (let
         (
             (executor tx-sender)
             (execution-id (+ (var-get last-execution-id) u1))
-            (target-contract (unwrap-panic (element-at target-contracts u0)))
+            (first-amount (default-to u0 (element-at amounts u0)))
+            (fee-amount (calculate-fee first-amount priority))
         )
-        (asserts! (is-whitelisted target-contract) ERR_INVALID_CONTRACT)
-        (asserts! (validate-safety-params max-slippage deadline min-output) ERR_SAFETY_CHECK_FAILED)
+        (asserts! (>= fee-amount (var-get min-fee-amount)) ERR_INSUFFICIENT_FEES)
+        (asserts! (is-some (map-get? priority-levels priority)) ERR_INVALID_PRIORITY)
         (asserts! (> (len operations) u0) ERR_INVALID_STEPS)
         
-        ;; Store safety config
-        (map-set safety-configs
-            execution-id
-            {
-                max-slippage: max-slippage,
-                deadline: deadline,
-                min-output: min-output
-            }
-        )
-        
-        ;; Update execution tracking
-        (map-set executions
-            execution-id
-            {
-                status: STATUS_INITIATED,
-                timestamp: block-height,
-                executor: executor
-            }
-        )
-        
-        ;; Store strategy steps
-        (map-set strategy-steps
-            execution-id
-            {
-                operation: (unwrap-panic (element-at operations u0)),
-                target-contract: target-contract,
-                amount: (unwrap-panic (element-at amounts u0)),
-                params: amounts
-            }
-        )
-        
-        (var-set last-execution-id execution-id)
-        (process-strategy-steps execution-id validator-contract operations target-contracts amounts)
+        (if (is-some batch-id)
+            (process-batch-execution 
+                execution-id 
+                (unwrap-panic batch-id)
+                validator-contract
+                operations
+                target-contracts
+                amounts
+                priority
+                fee-amount)
+            (process-individual-execution 
+                execution-id 
+                validator-contract 
+                operations 
+                target-contracts 
+                amounts 
+                priority 
+                fee-amount))
     )
 )
 
-(define-private (process-strategy-steps 
+;; Private helper functions
+(define-private (process-batch-execution 
+    (execution-id uint)
+    (batch-id uint)
+    (validator-contract <defi-validator-trait>)
+    (operations (list 10 (string-utf8 30)))
+    (target-contracts (list 10 principal))
+    (amounts (list 10 uint))
+    (priority uint)
+    (fee-amount uint))
+    (let
+        (
+            (batch (unwrap-panic (map-get? active-batches batch-id)))
+            (config (unwrap-panic (map-get? batch-configs batch-id)))
+        )
+        (if (< (len (get participants batch)) (get max-size config))
+            (begin
+                (map-set executions execution-id
+                    {
+                        status: STATUS_INITIATED,
+                        timestamp: block-height,
+                        executor: tx-sender,
+                        priority: priority,
+                        fee-paid: fee-amount,
+                        batch-id: (some batch-id)
+                    }
+                )
+                (var-set last-execution-id execution-id)
+                (ok execution-id))
+            ERR_BATCH_PROCESSING_FAILED)
+    )
+)
+
+(define-private (process-individual-execution 
     (execution-id uint)
     (validator-contract <defi-validator-trait>)
     (operations (list 10 (string-utf8 30)))
     (target-contracts (list 10 principal))
-    (amounts (list 10 uint)))
-    (let
-        (
-            (safety-config (unwrap-panic (map-get? safety-configs execution-id)))
-            (step (unwrap-panic (map-get? strategy-steps execution-id)))
-            (target-contract (get target-contract step))
+    (amounts (list 10 uint))
+    (priority uint)
+    (fee-amount uint))
+    (begin
+        (map-set executions execution-id
+            {
+                status: STATUS_INITIATED,
+                timestamp: block-height,
+                executor: tx-sender,
+                priority: priority,
+                fee-paid: fee-amount,
+                batch-id: none
+            }
         )
-        (if (and
-                (> (get amount step) u0)
-                (is-whitelisted target-contract)
-                (is-ok (contract-call? validator-contract validate
-                    target-contract
-                    (get operation step) 
-                    (get amount step) 
-                    (get params step))))
-            (begin
-                (map-set executions execution-id
-                    {
-                        status: STATUS_COMPLETED,
-                        timestamp: block-height,
-                        executor: tx-sender
-                    }
-                )
-                (ok execution-id)
-            )
-            (begin
-                (map-set executions execution-id
-                    {
-                        status: STATUS_FAILED,
-                        timestamp: block-height,
-                        executor: tx-sender
-                    }
-                )
-                ERR_SAFETY_CHECK_FAILED
-            )
-        )
+        (var-set last-execution-id execution-id)
+        (ok execution-id)
     )
 )
 
-;; Administrative functions
-(define-public (update-safety-thresholds (new-max-slippage uint))
+;; Fee Management
+(define-public (update-fee-parameters (new-min-fee uint) (new-basis-points uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set min-fee-amount new-min-fee)
+        (var-set fee-basis-points new-basis-points)
         (ok true)
-    )
-)
-
-(define-public (whitelist-contract (contract-principal principal))
-    (begin
-        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        (ok (map-set whitelisted-contracts contract-principal true))
-    )
-)
-
-(define-public (remove-whitelisted-contract (contract-principal principal))
-    (begin
-        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        (ok (map-set whitelisted-contracts contract-principal false))
     )
 )
